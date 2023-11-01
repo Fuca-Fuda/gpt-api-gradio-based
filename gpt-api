@@ -1,0 +1,307 @@
+import warnings
+warnings.filterwarnings('ignore')
+
+import os
+import re
+import openai
+import datetime
+import gradio as gr
+
+from transformers import GPT2Tokenizer
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+# 获取程序开始运行的时间，然后用它来创建一个文件名
+start_time = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+filename = f"{start_time}_history.txt"
+
+# 创建一个名为"History"的子目录（如果它还不存在的话）
+os.makedirs("History", exist_ok=True)
+
+# 完整的文件路径
+file_path = os.path.join("History", filename)
+
+# 填入你的OPENAI_API_KEY
+openai.api_key = "YOUR_API_KEY"
+
+########################################
+
+MAX_LENGTH = 16384   # 模型的最大token
+MAX_TOKENS = 2048# 生成响应的最大token
+# TOKEN_LENGTH = 2.1# 假设每个字符都会被编码为token_length个token
+
+MODEL_NAME = "gpt-3.5-turbo-16k"
+
+TEMPERATURE = 0.8  # 0-1，整体传统-整体创造
+TOP_P = 0.9  # 0-1，词汇选择少-词汇选择多
+FREQUENCY_PENALTY = 0  # 0-1，常见词多-常见词少
+PRESENCE_PENALTY = 0  # 0-1，曾用词多-曾用词少
+
+INTER_SWITCH = "CONTINUOUS" # 交互模式，0连续模式，1独立模式
+
+########################################
+
+messages = []
+history = []
+last_messages_input_index = None
+last_history_input_index = None
+last_user_input = ""
+his_count = 0
+
+def gpt_response(user_input):
+    try:
+        global messages, history, last_messages_input_index, last_history_input_index, last_user_input, his_count, TEMPERATURE, TOP_P, FREQUENCY_PENALTY, PRESENCE_PENALTY, MAX_LENGTH, MAX_TOKENS, MODEL_NAME, INTER_SWITCH
+
+        # 处理用户输入，删除末尾的空格和回车符
+        user_input = user_input.rstrip()
+        
+        # 找到massages中最后一次用户输入的消息索引
+        last_messages_input_index = None
+        for i in reversed(range(len(messages))):
+            if messages[i]['role'] == 'user':
+                last_messages_input_index = i
+                break
+        
+        # 找到history中最后一次用户输入的消息索引
+        last_history_input_index = None
+        for i in reversed(range(len(history))):
+            if history[i]['role'] == 'user':
+                last_history_input_index = i
+                break        
+
+        # 帮助信息
+        help_info_list = [
+        "back >> ba/back", 
+        "restart >> rs/restart",
+        "history >> ha/hr(all/recent 4)",
+        "system information >> info/information", 
+        "interactive switch >> ic/ii(continuous/independent)",
+        "================================", 
+        "gpt3/gpt4 model switch >> gpt3/gpt4",
+        "max tokens adjustment >> mt1/mt2/mt4/mt8(1024/2048/4096/8192)",
+        "mode switch >> lm/logic mode, gm/general mode, cm/creative mode"
+        ]
+
+        # 使用join函数将列表中的各元素以换行符('\n')连接
+        help_info = '\n'.join(help_info_list)
+
+        # 检查输入是否要求显示帮助信息
+        if user_input.lower() in ["help", "tips", "HELP", "TIPS"]:
+            return help_info
+        
+        # 检查输入是否要求重置系统
+        elif user_input.lower() in ["rs", "restart", "RS", "RESTART"]:
+            messages = []
+            history = []
+            # last_user_input_index = None
+            return "System has been reset."
+        
+        # 检查输入是否要求切换交互模式
+        elif user_input.lower() in ["ic", "ii", "IC", "II"]:
+            if user_input.lower() in ["ic","IC"]:
+                INTER_SWITCH = "CONTINUOUS"
+                return f"Switched to Continuous Interaction"
+            else :
+                INTER_SWITCH = "INDEPENDENT"
+                return f"Switched to Independent Interaction."
+        
+        # 检查输入是否要求切换模型
+        elif user_input.lower() in ["gpt3", "gpt4", "GPT3", "GPT4"]:
+            if user_input.lower() in ["gpt3","GPT3"]:
+                MODEL_NAME = "gpt-3.5-turbo-16k"
+                MAX_LENGTH = 16384          
+                return f"The model has now transitioned to gpt-3.5-turbo-16k."
+            else :
+                MODEL_NAME = "gpt-4"
+                MAX_LENGTH = 8192
+                return f"The model has now transitioned to gpt-4."
+            
+        # 检查输入是否要调整最大tokens
+        elif user_input.lower() in ["mt1", "mt2", "mt4", "mt8", "MT1", "MT2", "MT4", "MT8"]:       
+            if user_input.lower() in ["mt1", "MT1"]:
+                MAX_TOKENS = 1024
+                return f"The max_tokens has now transitioned to 1024."
+            elif user_input.lower() in ["mt2", "MT2"]:
+                MAX_TOKENS = 2048
+                return f"The max_tokens has now transitioned to 2048."
+            elif user_input.lower() in ["mt4", "MT4"]:
+                MAX_TOKENS = 4096
+                return f"The max_tokens has now transitioned to 4096."
+            else:
+                MAX_TOKENS = 8192
+                return f"The max_tokens has now transitioned to 8192."
+
+        # 检查输入是否要求读取记录
+        elif user_input.lower() in ["ha", "hr", "HA", "HR"]:
+            # 从输出的txt文件中读取内容
+            if his_count != 0:  # 检查是否有聊天记录
+                with open(file_path, "r", encoding="utf-8") as f:
+                    output_content = f.read()
+
+                if user_input.lower() in ["ha", "HA"]:
+                    return output_content
+                elif user_input.lower() in ["hr", "HR"]:
+                    # 从文件的末尾开始，查找包含"================================"的行
+                    lines = output_content.split('\n')
+                    target_lines = []
+                    count = 0
+                    target_index = -1  # 用于记录第五个出现"==="的行的索引
+
+                    for index, line in enumerate(reversed(lines)):
+                        if "================================" in line:
+                            count += 1
+                        if count == 5:
+                            target_index = len(lines) - 1 - index  # 找到第五个"==="行的索引
+                            break
+
+                    if target_index != -1:
+                        target_lines = lines[target_index:]  # 从第五个"==="开始到文件末尾的所有行
+                    else:
+                        target_lines = lines  # 如果不足五个"==="，则输出全部内容
+
+                    output_content = '\n'.join(target_lines)
+
+                    return output_content
+            else:
+                return "No conversation history available."
+            
+        # 检查输入是否要求删除上一次对话
+        elif user_input.lower() in ["ba", "back", "BA", "BACK"]:
+            if last_messages_input_index == None or last_messages_input_index == 0:
+                return "No previous conversation to delete."
+            else:
+                # Remove the last user input and assistant response
+                messages = messages[:last_messages_input_index]
+                history = history[:last_history_input_index]
+                return "Last conversation has been removed."
+
+        # 检查输入是否要求切换模式
+        elif user_input.lower() in ["logic mode", "lm"]:
+            TEMPERATURE = 0.5
+            TOP_P = 0.5
+            FREQUENCY_PENALTY = 0.0
+            PRESENCE_PENALTY = 0.0
+            return "Switched to Logic Mode."
+
+        elif user_input.lower() in ["general mode", "gm"]:
+            TEMPERATURE = 0.8
+            TOP_P = 0.9
+            FREQUENCY_PENALTY = 0
+            PRESENCE_PENALTY = 0
+            return "Switched to General Mode."
+
+        elif user_input.lower() in ["creative mode", "cm"]:
+            TEMPERATURE = 0.9
+            TOP_P = 0.9
+            FREQUENCY_PENALTY = 0.0
+            PRESENCE_PENALTY = 0.0
+            return "Switched to Creative Mode."
+
+        # 检查输入是否要求显示参数
+        elif user_input.lower() in ["info", "information", "INFO", "INFORMATION"]:
+            cur_info = f"MODEL_NAME = {MODEL_NAME}\nMAX_LENGTH = {MAX_LENGTH}\nMAX_TOKENS = {MAX_TOKENS}\nTEMPERATURE = {TEMPERATURE}\nTOP_P = {TOP_P}\nFREQUENCY_PENALTY = {FREQUENCY_PENALTY}\nPRESENCE_PENALTY = {PRESENCE_PENALTY}\nINTER_SWITCH = {INTER_SWITCH}"
+            return cur_info
+
+        # 如果没有匹配到以上的任何指令，处理正常的对话输入
+        else:
+            # 交互模式处理
+            if INTER_SWITCH == "INDEPENDENT":
+                messages = []
+                # history = []
+                # last_user_input_index = None
+                
+            messages.append({"role": "user", "content": user_input})
+            history.append({"role": "user", "content": user_input})  # 保存用户输入到历史记录中
+            # last_messages_input_index = len(messages) - 1  # 更新上一次用户输入的索引
+            last_user_input = user_input  # 保存上一次用户输入
+
+        total_length = sum([len(tokenizer.tokenize(m['content'])) for m in messages])
+
+        # 如果总长度超过最大长度，就从第二条开始删除前面的部分，以完整的消息为单位删除
+        while total_length > MAX_LENGTH - MAX_TOKENS and len(messages) > 1:
+            removed_message = messages.pop(1)
+            total_length -= len(tokenizer.tokenize(removed_message['content']))
+
+        # history.append({"role": "system", "content": "********************************"})    
+        history.append({"role": "system", "content": ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"})
+
+        completion = openai.ChatCompletion.create(
+            model=MODEL_NAME,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            top_p=TOP_P,
+            frequency_penalty=FREQUENCY_PENALTY,
+            presence_penalty=PRESENCE_PENALTY,
+            messages=messages
+        )
+
+        chat_response = completion
+        answer = chat_response.choices[0].message.content
+
+        messages.append({"role": "assistant", "content": answer})
+        history.append({"role": "assistant", "content": answer})
+        
+        # 重新找到massages中最后一次用户输入的消息索引
+        last_messages_input_index = None
+        for i in reversed(range(len(messages))):
+            if messages[i]['role'] == 'user':
+                last_messages_input_index = i
+                break
+        
+        # 重新找到history中最后一次用户输入的消息索引
+        last_history_input_index = None
+        for i in reversed(range(len(history))):
+            if history[i]['role'] == 'user':
+                last_history_input_index = i
+                break
+        
+        output_time = datetime.datetime.now().strftime("%H:%M:%S")
+        history.append({"role": "system", "content": f"(Input token: {int(total_length)}, Output token: {int(len(tokenizer.tokenize(answer)))})"})
+        history.append({"role": "system", "content": f"================[{output_time}]================"})
+        
+        # 生成输出文本，在每条消息后面添加一个额外的换行符
+        output = "\n\n".join([f">>Input:\n{m['content']}" if m['role'] == 'user' else f">>Output:\n{m['content']}" if m['role'] == 'assistant' else m['content'] for m in history])
+
+        with open(file_path, "a", encoding="utf-8") as f:
+            save_time = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+            additional_content = f"\n\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n{save_time}\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+            f.write(output + additional_content + "\n")
+            
+        his_count = his_count + 1
+
+        return user_input
+    
+    except Exception as e:
+        return str(e)  # 如果发生错误，将错误信息返回到Gradio界面上
+
+# 获取当前时间并格式化为字符串，例如"2023-06-28 14:30"
+title_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+# Gradio Blocks创建：
+
+def handle_input(user_input):
+    global output_data
+    output_data = gpt_response(user_input)
+    return output_data
+
+def show_output():
+    global history
+    if history:
+        return "\n\n".join([f">>Input:\n{m['content']}" if m['role'] == 'user' else f">>Output:\n{m['content']}" if m['role'] == 'assistant' else m['content'] for m in history])
+    else:
+        return "There's no previous conversation to recover. Please enter a new conversation."
+
+with gr.Blocks(theme=gr.themes.Soft()) as gpt_ui:
+    gr.HTML(f"<div style='font-size:24px;'><b>GPT-API ({title_time})</b></div>")  # 设置标题
+    gr.HTML("<div style='text-align: left; font-size:16px;'>Enter help/tips for usage instructions.</div>") # 文字说明
+    
+    input_box = gr.Textbox(label="Input", lines=3)
+    with gr.Row():
+        clear_btn = gr.ClearButton(input_box)
+        input_btn = gr.Button("Input")
+        input_btn.click(fn=handle_input, inputs=input_box, outputs=input_box, api_name="gpt_ui")
+     
+    output_box = gr.Textbox(label="Output")
+    show_btn = gr.Button("Refresh")
+    show_btn.click(fn=show_output, outputs=output_box)
+
+gpt_ui.launch(share=True, enable_queue = False)
